@@ -1,0 +1,273 @@
+---
+title: "Implementación Anexo I"
+author: "FGK"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(INLA)
+library(tmap)
+library(sf)
+
+```
+
+Regresión espacial para datos geoestadísticos ejemplo predicción coeficiente de adsorción de atrazina (Kda)
+
+Datos
+
+```{r, message=FALSE }
+kda <- read.table("kda.txt", header = TRUE, sep = "\t")
+
+kda_sf = st_as_sf(kda, coords=c("x","y") ,crs = 22174 )
+
+limits <- st_read("Cordoba_f4.shp")
+
+limits_sf <- st_transform(limits, st_crs(kda_sf))
+
+tm_shape(limits_sf)+
+  tm_polygons(col="#F4F4F4")+
+  tm_graticules(ticks = FALSE, alpha=0.3,labels.size = 1)+
+  tm_shape(kda_sf)+
+  tm_dots("LN_Kda", title='LN_Kda',
+          pal="-viridis",#n=4,
+          style = "quantile",
+          size = 0.4,
+          title.size=2,
+          legend.hist = TRUE)+
+  tm_layout(
+    legend.format = list(text.separator = " a "),
+    legend.outside = TRUE,
+    legend.hist.width = 1,
+    legend.hist.size = 1) +
+  tm_legend(text.size=1)
+```
+
+Para modelar la correlación espacial con del modelo de Matern a traves de una solución utilizando SPDE
+se debe construir una malla de traiangulos, en los nodos de esta malla se estima el campo aleatorio utilizando FEM (Metodo de los elementos finitos) 
+
+Luego, para la malla se construye una matriz de pesos espaciales que por notación llamamos matriz $A$.
+
+La malla se puede construir de diversas formas utilizando limites o no y la y la recomendación es que los triángulos sean homogéneos en tamaño y forma 
+
+Construcción de la malla
+
+```{r, message=FALSE  }
+#SPDE
+#sitios observados
+loc.obs <- st_coordinates(kda_sf)
+
+#definición del dominio espacial
+boundary.loc <- SpatialPoints(as.matrix(loc.obs))
+boundary <- list(
+  inla.nonconvex.hull(coordinates(boundary.loc), 81000),
+  inla.nonconvex.hull(coordinates(boundary.loc), 111000))
+
+#definición de los parámetros de la malla 
+mesh <- inla.mesh.2d(boundary.loc,boundary=boundary,
+                     max.edge=c(20000, 80000),
+                     min.angle=c(30, 20),
+                     max.n=c(48000, 16000), 
+                     max.n.strict=c(128000, 128000), 
+                     cutoff=200,
+                     offset=c(81000, 111000))
+
+#gráfico
+plot(mesh)
+points(loc.obs, pch=16 ,col = "blue")
+```
+
+Matriz A
+
+```{r, message=FALSE  }
+#definición la estructura de covarianza sobre la malla 
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2) 
+
+#Se proyecta esta estructura sobre los sitios observados es decir se define A
+A <- inla.spde.make.A(mesh = mesh, loc = loc.obs)
+
+s <- inla.spde.make.index(name = "s", n.spde = spde$n.spde)
+```
+
+Ajuste del modelo
+
+Para facilitar el manejo se implementa un sistema de organización
+denominado stack que organiza los elementos de la estimación, el vector de la variable respuesta, la matriz A, la matriz de covariables
+
+```{r, message=FALSE  }
+
+stk.est <- inla.stack(
+  data = list(LN_Kda = kda$LN_Kda),
+  A = list(A, 1),
+  effects=list(s=1:spde$n.spde,
+               data.frame(Intercept=1,
+                          Elevation=kda$Elevation,
+                          PPanual=kda$PPanual,
+                          SOC=kda$SOC,
+                          TvsPP=kda$TvsPP,
+                          Clay=kda$Clay)),
+  tag = 'est'
+)
+
+#aJuste del modelo
+
+formula = LN_Kda~ -1+Intercept+TvsPP+PPanual+SOC+Clay+ f(s, model = spde)
+
+
+res_est <- inla(
+  formula,
+  family = "gaussian",
+  data = inla.stack.data(stk.est),
+  control.predictor = list(A = inla.stack.A(stk.est), link=1, compute = TRUE)
+)
+```
+
+
+Resultados del modelo
+
+```{r, message=FALSE  }
+summary(res_est)
+```
+
+
+Resultados de la estructura espacial
+
+```{r, message=FALSE  }
+spde.est = inla.spde2.result(inla = res_est,
+                                   name = "s",
+                                   spde = spde,
+                                   do.transform = TRUE)
+
+#Estadísticos de posición Varianza nominal
+inla.zmarginal(spde.est$marginals.variance.nominal[[1]])
+
+#Rango
+inla.zmarginal(spde.est$marginals.range.nominal[[1]])
+```
+
+Predicción sobre una grilla de predicción
+
+```{r, message=FALSE  }
+# Datos
+grid <- st_read("modelsel_serv/grid_kda_sf.gpkg") %>% st_transform(crs = st_crs(kda_sf))
+
+```
+
+El efecto aleatorio espacial estimado debe proyectarse soobre la grilla de sitios no observados sobre los que se quiere predecir.
+Se puede graficar los ponderadores espacales en la matriz A
+
+```{r, message=FALSE  }
+
+#prohjección y definición de A de predicción
+A.pred <- inla.spde.make.A(mesh = mesh, loc = st_coordinates(grid))
+project <- inla.mesh.projector(mesh, loc = st_coordinates(grid))
+grid$sp.mean <- inla.mesh.project(project, res_est$summary.ran$s$mean)
+
+tm_shape(grid)+
+  tm_dots(
+    "sp.mean",
+    style="cont",
+    pal="Spectral",
+    title='Efecto espacial',
+    size =0.1,
+    title.size=2) +
+  tm_graticules(ticks = FALSE, alpha=0.3,labels.size = 1)+
+  tm_layout(
+    legend.format = list(text.separator = " a "),
+    legend.outside = TRUE,
+    legend.hist.width = 1,
+    legend.hist.size = 1) +
+  tm_legend(text.size=1)
+```
+
+Se debe generar un stack de predicción y luego juntarla con el stack de estimación
+
+```{r, message=FALSE  }
+#organización los inputs en un stack de predicción
+stk.pred = inla.stack(data = list(LN_Kda = NA),
+                    A = list(A.pred, 1),
+                    effects = list(s=1:spde$n.spde,
+                      data.frame(Intercept=1,
+                      Elevation=grid$Elevation,
+                      PPanual=grid$PPanual,
+                      SOC=grid$SOC,
+                      TvsPP=grid$TvsPP,
+                      Clay=grid$Clay)),
+                    tag = "pred")
+
+#union de inputs de estimación y predicción en una stack conjunta
+stk.all <- inla.stack(stk.est, stk.pred)
+
+#Ajuste del modelo con datos faltandes de la variable
+#respuestas en los sitios no observados
+
+res_pred = inla(formula = formula,
+              data = inla.stack.data(stk.all, spde = spde),
+              family = "gaussian",
+              control.predictor = list(A = inla.stack.A(stk.all)
+                                       ,compute = TRUE))
+```
+
+Resultados de la prediccion
+
+```{r, message=FALSE  }
+
+#Cambian ligeramente las estimaciones del modelo
+spde.pred = inla.spde2.result(inla = res_pred,
+                                    name = "s",
+                                    spde = spde,
+                                    do.transform = TRUE)
+#Varianza nominal
+inla.zmarginal(spde.est$marginals.variance.nominal[[1]])
+inla.zmarginal(spde.pred$marginals.variance.nominal[[1]])
+```
+
+Extracción de resultados y mapeo
+
+```{r, message=FALSE }
+# Mapeo
+
+igr <- inla.stack.index(stk.all,'pred')$data
+
+grid_map <- grid %>%
+  bind_cols(res_pred$summary.fitted.values[igr, ]) %>%
+  mutate(Kda_pred=exp(mean),
+         Kda0.025quant=exp(`0.025quant`),
+         Kda0.975quant=exp(`0.975quant`),
+         KdaIC95=exp(`0.975quant`)-exp(`0.025quant`)
+         )
+
+# Media de la distribución a posteriori
+tm_shape(grid_map) +
+  tm_dots(
+    "Kda_pred",
+    style = "cont",
+    palette = "-viridis",
+    title = "Predicción de Kda",
+    size = 0.1) +
+  tm_graticules(ticks = FALSE, alpha=0.3,labels.size = 1)+
+  tm_layout(
+    legend.format = list(text.separator = " a "),
+    legend.outside = TRUE,
+    legend.hist.width = 1,
+    legend.hist.size = 1) +
+  tm_legend(text.size=1)
+
+# Medida de incertidumbre IC95
+tm_shape(grid_map)+
+  tm_dots("KdaIC95",
+          style="cont",
+          pal="cividis",
+          title='Amplitud IC95%',
+          size =0.1)+
+  tm_graticules(ticks = FALSE, alpha=0.3,labels.size = 1)+
+  tm_layout(
+    legend.format = list(text.separator = " a "),
+    legend.outside = TRUE,
+    legend.hist.width = 1,
+    legend.hist.size = 1) +
+  tm_legend(text.size=1)
+```
